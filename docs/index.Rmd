@@ -22,10 +22,7 @@ Oxford Nanopore Technologies (ONT) produce instruments capable of sequencing lon
 * Does this read length change over the course of a sequencing run? 
 
 ## _Data collection and pre-processing_
-Data were collected from the Integrated Microbial Genomes and Microbiomes (IMG) repository...
-<br>
-
-Data were initially pre-processed using the code in the chunks below. If not otherwise mentioned, all programs are open-source and publicly available. They were installed in their own environment using the conda package manager. An example of this can be found on the appendix.
+Just as a demonstration, I downloaded some publicly available data and downsampled it for ease of use.Data were initially pre-processed using the code in the chunks below. If not otherwise mentioned, all programs are open-source and publicly available. They were installed in their own environment using the conda package manager. An example of this can be found on the appendix.
 
 ```{r pre_processing_read_filter, warning=FALSE, eval=FALSE}
 # Read filtering using bbduk from the bbtools suite
@@ -49,8 +46,8 @@ samtools faidx {filtered_fasta}
 <br>
 The fasta indices created by samtools have the following format, from htslib^2^:
 
-NAME | LENGTH | OFFSET | LINEBASES | LINEWIDTH | QUALOFFSET
------| -------|--------|-----------|-----------|------------
+NAME | LENGTH | OFFSET | LINEBASES | LINEWIDTH |
+-----| -------|--------|-----------|-----------|
      |        |        |           |           |
 
 * __NAME__:	Name of this reference sequence
@@ -58,7 +55,6 @@ NAME | LENGTH | OFFSET | LINEBASES | LINEWIDTH | QUALOFFSET
 * __OFFSET__:	Offset in the FASTA/FASTQ file of this sequence's first base
 * __LINEBASES__:	The number of bases on each line
 * __LINEWIDTH__:	The number of bytes in each line, including the newline
-* __QUALOFFSET__:	Offset of sequence's first quality within the FASTQ file
 
 Additionally, I have added a column after name called __TIME__, which contains the time at which the read was sequenced. This information is parsed from the fasta header (after using setqk seq -a) using Bash.
 <br>
@@ -68,10 +64,10 @@ The code below creates lists containing the fasta indices (suffix=.fai, or faidx
 
 ```{r list_indices, warning=FALSE}
 # List .fai files for both filtered and unfiltered
-filtered_fai_files = list.files("filtered/", 
-                                pattern = "NIFP2400*", full.names = TRUE)
-unfiltered_fai_files = list.files("non-filtered/2024_03_26/", 
-                                  pattern = "*.fasta.datetime.fai", full.names = TRUE)
+filtered_fai_files = list.files("github_ont_demo/sample_data/filtered/", 
+                                pattern = "*sample.datetime.fai", full.names = TRUE)
+unfiltered_fai_files = list.files("github_ont_demo/sample_data/non-filtered/", 
+                                  pattern = "*sample.datetime.fai", full.names = TRUE)
 ```
 <br>
 For each data type (filtered and unfiltered) and sample, we next import the index files as tables, now referred to as data frames, using read_tsv. These new objects have the same structure as the previous lists, but instead of each element containing a file ID, e.g. "filtered/file1_filt.fasta.fai", it now contains the data associated with that file in tabular format. We do this by first writing a function called *import_faidx*. We then apply that function to both the list of filtered files and the list of unfiltered files.
@@ -88,17 +84,17 @@ import_faidx <- function(file_list, filtered=TRUE){
     # Read the data associated with each index ID into a tab-separated table
     tmp_df = read_tsv(file_list[[f]], 
                       col_names = c("NAME","TIME","LENGTH","OFFSET", 
-                                    "LINEBASES","LINEWIDTH","QUALOFFSET"), 
+                                    "LINEBASES","LINEWIDTH"), 
                      show_col_types = FALSE) |>
       mutate(DATETIME = as.numeric(as_datetime(TIME)))
     
     # Add a sample ID to each table, including the index ID and whether or not its filtered
     if(filtered==TRUE){
-      nm = gsub("_filt.fasta.fai", "", basename(file_list[[f]]))
+      nm = gsub("_filt.sample.datetime.fai", "", basename(file_list[[f]]))
       tmp_df$SAMPLE=nm
       tmp_df$FILT="filtered"
     } else if(filtered==FALSE){
-      nm = gsub(".fasta.datetime.fai", "", basename(file_list[[f]]))
+      nm = gsub(".sample.datetime.fai", "", basename(file_list[[f]]))
       tmp_df$SAMPLE=nm
       tmp_df$FILT="unfiltered"
     }
@@ -112,9 +108,9 @@ import_faidx <- function(file_list, filtered=TRUE){
   # The file endings vary slightly for filtered vs unfiltered samples
   # This is why we need a conditional statement, i.e. if..else
   if(filtered==TRUE){
-    names(output_list) = gsub("_filt.datetime.fasta.fai", "", basename(file_list))
+    names(output_list) = gsub("_filt.sample.datetime.fai", "", basename(file_list))
   } else{
-    names(output_list) = gsub(".fasta.datetime.fai", "", basename(file_list))
+    names(output_list) = gsub(".sample.datetime.fai", "", basename(file_list))
   }
   
   return(output_list)
@@ -323,7 +319,7 @@ lost_basepairs = abs(est_corr_coef) * length_seq_run
 average_loss_per_read = round(lost_basepairs/total_reads,5)
 ```
 
-The *across_samples* model indicates a highly significant correlation. However, the estimated coefficient was `r est_corr_coef`. This means that we see a decrease of `r abs(est_corr_coef)` base pairs per unit time, in this case per second, across all nanopores. When spread across all `r total_reads` reads, this means we lose an average of `r average_loss_per_read` base pairs per read over the course of a run, an inconsequential amount of data.
+The *across_samples* model indicates there is no significant correlation between read length and time. Let's just for a second assume this relationshop was significant. How much data are we loving? The estimated coefficient was `r est_corr_coef`. This means that we see a decrease of `r abs(est_corr_coef)` base pairs per unit time, in this case per second, across all nanopores. When spread across all `r total_reads` reads, this means we lose an average of `r average_loss_per_read` base pairs per read over the course of a run, an inconsequential amount of data.
 <br>
 
 ## _References_
