@@ -1,0 +1,345 @@
+---
+title: "Assessing ONT Length Distributions and Suitability for Metagenomics"
+author: "Noah Winters"
+date: "08 AUG 2024"
+output:
+  html_document:
+    df_print: paged
+---
+```{r, packages, include=FALSE, warning=FALSE, echo=FALSE}
+library("tidyverse")
+library("cowplot")
+library("MASS")
+library("lubridate")
+library("kableExtra")
+```
+
+
+## _Background_
+Oxford Nanopore Technologies (ONT) produce instruments capable of sequencing long strings of nucleic acids. These instruments are fast, easy to use, and relatively inexpensive. For these reasons, ONT has been increasingly used for metagenomic sequencing. Here we assess QC metrics for ONT sequencing, including:
+
+* Does ONT sequencing consistently produce long reads even after filtering? 
+* Does this read length change over the course of a sequencing run? 
+
+## _Data collection and pre-processing_
+Data were collected from the Integrated Microbial Genomes and Microbiomes (IMG) repository...
+<br>
+
+Data were initially pre-processed using the code in the chunks below. If not otherwise mentioned, all programs are open-source and publicly available. They were installed in their own environment using the conda package manager. An example of this can be found on the appendix.
+
+```{r pre_processing_read_filter, warning=FALSE, eval=FALSE}
+# Read filtering using bbduk from the bbtools suite
+bbduk.sh in={fastq} out={filtered_fastq} \
+  k=23 mink=11 hdist=3 \
+  entropy=0.5 entropytrim=rl \
+  trimpolya=8 trimpolyg=8 trimq=7 \
+  minlength=100 maxlength=1000000 \
+  qtrim=w -da
+```
+
+I used bbduk, part of Brian Bushnell's btools suite^1^, to filter low quality base pairs. I also removed very short and very long reads. This may seem odd, since read length is what we're interested in measuring. But reads at the very tails of the length distribution are likely to be spurious and it is best to remove them. 
+
+```{r convert_fastq_create_index, warning=FALSE, eval=FALSE}
+# Convert filtered fastq files to fasta using seqtk
+seqtk seq -a {filtered_fastq} > {filtered_fasta} 
+
+# Create a fasta index file using samtools
+samtools faidx {filtered_fasta}
+```
+<br>
+The fasta indices created by samtools have the following format, from htslib^2^:
+
+NAME | LENGTH | OFFSET | LINEBASES | LINEWIDTH | QUALOFFSET
+-----| -------|--------|-----------|-----------|------------
+     |        |        |           |           |
+
+* __NAME__:	Name of this reference sequence
+* __LENGTH__:	Total length of this reference sequence, in bases
+* __OFFSET__:	Offset in the FASTA/FASTQ file of this sequence's first base
+* __LINEBASES__:	The number of bases on each line
+* __LINEWIDTH__:	The number of bytes in each line, including the newline
+* __QUALOFFSET__:	Offset of sequence's first quality within the FASTQ file
+
+Additionally, I have added a column after name called __TIME__, which contains the time at which the read was sequenced. This information is parsed from the fasta header (after using setqk seq -a) using Bash.
+<br>
+
+The code below creates lists containing the fasta indices (suffix=.fai, or faidx for short) for both the filtered and unfiltered samples. One list contains the filtered indices, the other contains the unfiltered indices.
+
+
+```{r list_indices, warning=FALSE}
+# List .fai files for both filtered and unfiltered
+filtered_fai_files = list.files("filtered/", 
+                                pattern = "NIFP2400*", full.names = TRUE)
+unfiltered_fai_files = list.files("non-filtered/2024_03_26/", 
+                                  pattern = "*.fasta.datetime.fai", full.names = TRUE)
+```
+<br>
+For each data type (filtered and unfiltered) and sample, we next import the index files as tables, now referred to as data frames, using read_tsv. These new objects have the same structure as the previous lists, but instead of each element containing a file ID, e.g. "filtered/file1_filt.fasta.fai", it now contains the data associated with that file in tabular format. We do this by first writing a function called *import_faidx*. We then apply that function to both the list of filtered files and the list of unfiltered files.
+
+```{r, import_faidx_function, warning=FALSE}
+# Function to read the fai files into a table, and add that table to a list we can iterate over
+import_faidx <- function(file_list, filtered=TRUE){
+  # Initiate empty list so we can add to it
+  output_list = list()
+
+  # Loop over list of file names
+  for(f in seq_along(file_list)){
+    
+    # Read the data associated with each index ID into a tab-separated table
+    tmp_df = read_tsv(file_list[[f]], 
+                      col_names = c("NAME","TIME","LENGTH","OFFSET", 
+                                    "LINEBASES","LINEWIDTH","QUALOFFSET"), 
+                     show_col_types = FALSE) |>
+      mutate(DATETIME = as.numeric(as_datetime(TIME)))
+    
+    # Add a sample ID to each table, including the index ID and whether or not its filtered
+    if(filtered==TRUE){
+      nm = gsub("_filt.fasta.fai", "", basename(file_list[[f]]))
+      tmp_df$SAMPLE=nm
+      tmp_df$FILT="filtered"
+    } else if(filtered==FALSE){
+      nm = gsub(".fasta.datetime.fai", "", basename(file_list[[f]]))
+      tmp_df$SAMPLE=nm
+      tmp_df$FILT="unfiltered"
+    }
+    
+    
+    # Assign each table to its appropriate element in the nested list
+    output_list[[f]] = tmp_df
+  }
+  
+  # Name each element in list according to the file name
+  # The file endings vary slightly for filtered vs unfiltered samples
+  # This is why we need a conditional statement, i.e. if..else
+  if(filtered==TRUE){
+    names(output_list) = gsub("_filt.datetime.fasta.fai", "", basename(file_list))
+  } else{
+    names(output_list) = gsub(".fasta.datetime.fai", "", basename(file_list))
+  }
+  
+  return(output_list)
+}
+
+```
+
+### _Does ONT sequencing consistently produce long reads even after filtering?_
+```{r, import_faidx, warning=FALSE}
+# Now we use the _import_faidx_ function to import the indices as tables
+filtered_faidx = import_faidx(file_list = filtered_fai_files, filtered = TRUE)
+unfiltered_faidx = import_faidx(file_list = unfiltered_fai_files, filtered = FALSE)
+```
+<br>
+Once we read each individiaul index into a data frame and add it to the list, we can begin generating summary statistics for each sample. We will begin by writing a function to calculate read length summary statistics for each sample, *summarize_read_length*:
+
+* __mean_length__: Average read length per sample
+* __sd_length__: Standard deviation of read lenzgth for each sample
+* __max_length__: Longest read in each sample
+* __median_length__: Median read length per sample
+* __total_bases__: Sum of read lengths, total sequenced bases
+* __q1__: The 25th percentile of read length for each sample
+* __q3__: The 75th percentile of read length for each sample
+
+We will then use this function to iteratively calculate summary statistics for each data frame in *filtered_faidx* and *unfiltered_faidx*.
+<br>
+```{r read_length_summary_function, warning=FALSE}
+# Function to calculate length summary statistics for each sample
+summarize_read_length = function(input_df){
+  # Summarises mean length, median length etc. 
+  # Then calculates standard error, confidence intervals using these summaries
+  summary = 
+    input_df |>
+    group_by(SAMPLE, FILT) |>
+    summarise(
+      mean_length = round(mean(LENGTH),3),
+      sd_length = round(sd(LENGTH),3),
+      max_length = max(LENGTH),
+      median_length = median(LENGTH),
+      total_bases = sum(LENGTH),
+      n_reads = n(), 
+  .groups = "keep") |>
+  mutate(se_length = round((sd_length / sqrt(n_reads)),3),
+         lower_ci = round((mean_length - qt(1 - (0.05 / 2), n_reads - 1) * se_length),3),
+         upper_ci = round((mean_length + qt(1 - (0.05 / 2), n_reads - 1) * se_length),3))
+      
+  return(summary)
+}
+```
+
+```{r summarize_read_lengths, warning=FALSE}
+# Iterate over list and apply function to each data frame, create new summary list 
+
+# Filtered samples
+summary_filtered_faidx = list()
+for(f in filtered_faidx){
+  summary = summarize_read_length(f)
+  summary_filtered_faidx[[summary$SAMPLE]] = summary
+}
+summary_filtered_faidx = bind_rows(summary_filtered_faidx)
+
+# Unfiltered samples
+summary_unfiltered_faidx=list()
+for(f in unfiltered_faidx){
+  summary = summarize_read_length(f)
+  summary_unfiltered_faidx[[summary$SAMPLE]] = summary
+}
+summary_unfiltered_faidx = bind_rows(summary_unfiltered_faidx)
+
+#project="2024_03_26_TNA_Ticks_Summary_Statistics"
+#comb <- rbind(summary_filtered_faidx, summary_unfiltered_faidx)
+#write_csv(comb, paste0(project,".csv"), quote=NULL)
+```
+
+Now that we have calculated descriptive statistics for each sample, we need to visualize the data's distribution. This is because descriptive statistics alone do not provide a complete picture of the data's spread. A great example of this can be found here^3^, where Thomas Pfaff illustrates many different distributions that have the same mean.We are going to visualize our data using box and whisker plots, or boxplots for short. An image explaining what boxplots display can be found below^4^.
+
+<br>
+![Characteristics of a box and whisker plot.](Boxplot_Description.png)
+<br>
+
+Additionally, we add whats called a violin plot around each boxplot. violin plots are an effective way to show most of our data are located. That is, violin plots are widest at positions with the greatest number of observations. Note, we log~2~ transform read length. This effectively shrinks the very long or very short reads, allowing us to visualize them on the same plot. The black line indicates the global mean across samples.
+<br>
+```{r, boxplot_length_distributions, warning=FALSE}
+# Combine into single dataframe for plotting
+all_indices <- rbind(bind_rows(filtered_faidx),bind_rows(unfiltered_faidx))
+
+# Crete plot
+all_indices |>
+  ggplot(aes(y = SAMPLE, x = log2(LENGTH), fill=FILT)) +
+  geom_violin(show.legend = TRUE, width=0.9,
+              position=position_dodge(0.75), bw=1.5) +
+  geom_boxplot(show.legend = FALSE, outlier.shape=NA,
+               position=position_dodge(0.75), width = 0.3) + 
+  labs(y=NULL, x="log2[Read Length]", fill=NULL) + 
+  geom_vline(xintercept = median(log2(all_indices$LENGTH)), color="black", linewidth=1) +
+  theme_minimal_grid(font_size = 15) +
+  theme(
+    legend.direction = "horizontal",
+    legend.position = "bottom",
+    legend.justification = "center"
+  ) + 
+  scale_fill_manual(values = c("filtered"="steelblue", "unfiltered"="firebrick"))
+
+```
+
+### _Does this read length change over the course of a sequencing run?_
+<br>
+ONT sequencing works by applying a voltage across a membrane. This membrane contains a tiny hole, or nanopore, caused by a protein. Ions flow through this hole, creating an electrical current. Single strands of DNA are then passed through the nanopore. Each nucleotide base (A,T,G,C) alters the flow of current in a predictable way, and this alteration can be measured and recorded. The electrical signals coming from each pore can therefore be interpreted, with some effort, as sequence.  Pores, however, become non-functional as sequencing progresses. This can be due to a number of factors, but one common culprit is DNA contamination that clogs pores. 
+<br>
+
+The question I want to answer is: Does nanopore degradation over the course of a run cause differences in read length? In other words, are we sequencing our longest reads early, and our short reads late?
+
+```{r, example_correlation_functions, warning=FALSE, echo = FALSE}
+# Function to simulate correlated data
+simulate_correlated_data <- function(n, rho) {
+  # Generate two independent standard normal variables
+  x <- rnorm(n)
+  y <- rnorm(n)
+
+  # Create a correlation matrix
+  Sigma <- matrix(c(1, rho, rho, 1), nrow = 2)
+
+  # Generate correlated data
+  data <- mvrnorm(n, mu = c(0, 0), Sigma = Sigma)
+  colnames(data) <- c("x", "y")
+  return(data)
+}
+
+plot_fit <- function(df, x, y){
+ ggplot(df, aes(x = {{ x }}, y = {{ y }})) + 
+    geom_point(shape = 21, size =4, color = "black",fill = "cornsilk3" ) +
+    geom_smooth(method="lm", color = "firebrick", 
+                linewidth=2, linetype=6, se = FALSE) +
+    theme_bw(base_size = 20) + 
+    labs(y = "Read Length", x = "Time") +
+    theme(axis.ticks.x = element_blank(),
+          axis.text.x = element_blank(),
+          axis.ticks.y = element_blank(),
+          axis.text.y = element_blank()) + 
+    facet_grid(~corr) 
+}
+```
+
+```{r, example_correlations, warning=FALSE, echo = TRUE, message=FALSE}
+# Simulate data with different correlations
+set.seed(12)  # For reproducibility
+
+# Neutral correlation (rho = 0)
+neutral_data <- data.frame(simulate_correlated_data(100, 0))
+neutral_data$corr = "neutral"
+
+# Positive correlation (rho = 0.8)
+positive_data <- data.frame(simulate_correlated_data(100, 0.8))
+positive_data$corr = "positive"
+
+# Negative correlation (rho = -0.8)
+negative_data <- data.frame(simulate_correlated_data(100, -0.8))
+negative_data$corr = "negative"
+
+# Combine
+all_sim = rbind(neutral_data, positive_data, negative_data)
+
+# Plot neutral, positive, and negative correlations with simulated data.
+plot_fit(all_sim, x = x, y = y)
+```
+
+I am going to answer this question by correlating read length and time time. If there is no difference, we should see no correlation between read length and time, i.e. a flat line indicating no association (middle).If nanopore degradation does lead to shorter reads over the course of a run, I should see a negative correlation between time and read length (left). Lastly, if, through some unknown mechanism, nanopores become more effective through time, leading to an increase in read length, we will see a positive correlation (right).
+<br>
+
+More formally, I am going to test this using a linear mode, where our null and alternative hypotheses are:
+
+|       H~0~: There is no correlation between time and read length.
+|       H~1~: There is a correlation between time and read length. 
+
+```{r correlate_read_length_time, warning=FALSE, message=FALSE}
+# Test for relationship between read length and time _across_ a sample
+across_samples = 
+  broom::tidy(lm(DATETIME ~ LENGTH, data = all_indices)) |>
+  data.frame()
+
+across_samples |>
+  kable(caption = "Test for relationship between time and read length _across_ a sample")
+
+```
+
+The linear models indicate a significant correlation between time and read length, but the estimated correlation coefficients indicate a very slight negative slope. I would like to visualize this relationship. Unfortunately my dataframe is >8 million rows, so downsampling will be necessary. To do this I use *slice_sample* from the tidyverse package.
+<br>
+
+```{r downsample_plot, warning=FALSE, message=FALSE}
+# Randomly sample the data frame and plot the correlation
+all_indices |>
+  slice_sample(n = 100000) |>
+  mutate(DATETIME=DATETIME-min(DATETIME)) |>
+  ggplot(aes(x = DATETIME, y = log2(LENGTH))) + 
+  geom_point() + 
+  geom_smooth(method="lm", se = FALSE, color = "firebrick") + 
+  theme_bw(base_size = 20) + 
+  labs(x = "Time (Seconds)", y = "log2[Read Length]")
+
+# Over the course of a run, how much variation in length do we observe?
+total_reads = nrow(filter(all_indices, FILT=="unfiltered"))
+est_corr_coef = across_samples$estimate[2]
+length_seq_run = max(all_indices$DATETIME) - min(all_indices$DATETIME)
+
+lost_basepairs = abs(est_corr_coef) * length_seq_run
+average_loss_per_read = round(lost_basepairs/total_reads,5)
+```
+
+The *across_samples* model indicates a highly significant correlation. However, the estimated coefficient was `r est_corr_coef`. This means that we see a decrease of `r abs(est_corr_coef)` base pairs per unit time, in this case per second, across all nanopores. When spread across all `r total_reads` reads, this means we lose an average of `r average_loss_per_read` base pairs per read over the course of a run, an inconsequential amount of data.
+<br>
+
+## _References_
+^1^ https://jgi.doe.gov/data-and-tools/software-tools/bbtools/
+
+^2^ https://www.htslib.org/doc/faidx.html
+
+^3^ https://briefedbydata.substack.com/p/same-mean-different-distribution
+
+^4^ https://datatab.net/tutorial/box-plot
+
+## _Appendix_
+```{r conda_example, eval = FALSE, warning = FALSE, message = FALSE}
+# Create a conda environment with a specific software installation
+# Assumes conda is installed via https://docs.anaconda.com/miniconda/miniconda-install/
+conda create -n samtools_env samtools=1.13
+conda activate samtools_env
+```
+
